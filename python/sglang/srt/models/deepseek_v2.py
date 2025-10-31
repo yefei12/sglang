@@ -2640,6 +2640,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
+        self.layers_to_capture = []
         self.gemm_output_zero_allocator_size = 0
         if (
             _use_aiter_gfx95
@@ -2670,7 +2671,6 @@ class DeepseekV2Model(nn.Module):
                     self.embed_tokens.embedding_dim,
                 )
             )
-            self.layers_to_capture = []
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
