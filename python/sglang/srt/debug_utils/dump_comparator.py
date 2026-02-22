@@ -15,15 +15,12 @@ from sglang.srt.debug_utils.dumper import get_truncated_value
 
 def main(args):
     df_target = read_meta(args.target_path)
-    df_target = df_target.sort("rank", "dump_index")
     df_target = df_target.filter(
-        (pl.col("forward_pass_id") >= args.start_id)
-        & (pl.col("forward_pass_id") <= args.end_id)
+        (pl.col("step") >= args.start_id) & (pl.col("step") <= args.end_id)
     )
-    assert all(
-        c in df_target.columns
-        for c in ["rank", "forward_pass_id", "dump_index", "name"]
-    )
+    if args.filter:
+        df_target = df_target.filter(pl.col("filename").str.contains(args.filter))
+    assert all(c in df_target.columns for c in ["rank", "step", "dump_index", "name"])
 
     df_baseline = read_meta(args.baseline_path)
     print("df_target", df_target)
@@ -36,15 +33,13 @@ def main(args):
         path_target = Path(args.target_path) / row["filename"]
 
         if location_info_of_target_pass_id is not None:
-            location_info = location_info_of_target_pass_id.get(row["forward_pass_id"])
+            location_info = location_info_of_target_pass_id.get(row["step"])
             if location_info is None:
                 continue
-            baseline_forward_pass_id = location_info.baseline_forward_pass_id
+            baseline_step = location_info.baseline_step
             baseline_token_slice = location_info.baseline_token_slice
         else:
-            baseline_forward_pass_id = (
-                row["forward_pass_id"] - args.start_id + args.baseline_start_id
-            )
+            baseline_step = row["step"] - args.start_id + args.baseline_start_id
             baseline_token_slice = None
 
         tensor_dim_desc = None
@@ -60,11 +55,11 @@ def main(args):
         row_baseline = find_row(
             df_baseline,
             conditions=dict(
-                forward_pass_id=baseline_forward_pass_id,
+                step=baseline_step,
                 **{
                     k: v
                     for k, v in row.items()
-                    if k not in ["forward_pass_id", "dump_index", "filename"]
+                    if k not in ["step", "dump_index", "filename"]
                 },
             ),
         )
@@ -77,7 +72,11 @@ def main(args):
             continue
 
         path_baseline = Path(args.baseline_path) / row_baseline["filename"]
-        print(f"Check: target={str(path_target)} baseline={str(path_baseline)}")
+        print(
+            f"Check:\n"
+            f"target={str(path_target)} (duplicate_index={row['duplicate_index']})\n"
+            f"baseline={str(path_baseline)} (duplicate_index={row_baseline['duplicate_index']})"
+        )
         check_tensor_pair(
             path_baseline=path_baseline,
             path_target=path_target,
@@ -108,6 +107,12 @@ def check_tensor_pair(
 ):
     x_baseline = _load_object(path_baseline)
     x_target = _load_object(path_target)
+
+    if x_baseline is None or x_target is None:
+        print(
+            f"Skip comparison because of None: x_baseline={x_baseline}, x_target={x_target}"
+        )
+        return
 
     print(
         f"Raw "
@@ -218,7 +223,19 @@ def _compute_and_print_diff(
         )
     )
 
+    max_diff_coord = _argmax_coord(raw_abs_diff)
+    print(
+        f"max_abs_diff happens at coord={max_diff_coord} with "
+        f"baseline={x_baseline[max_diff_coord].item()} "
+        f"target={x_target[max_diff_coord].item()}"
+    )
+
     return dict(max_abs_diff=max_abs_diff)
+
+
+def _argmax_coord(x: torch.Tensor) -> tuple:
+    flat_idx = x.argmax()
+    return tuple(idx.item() for idx in torch.unravel_index(flat_idx, x.shape))
 
 
 def _compute_smaller_dtype(dtype_a, dtype_b):
@@ -251,7 +268,15 @@ def _calc_rel_diff(x: torch.Tensor, y: torch.Tensor):
 
 
 def _load_object(path):
-    x = torch.load(path, weights_only=False)
+    try:
+        x = torch.load(path, weights_only=False)
+    except Exception as e:
+        print(f"Skip load {path} since error {e}")
+        return None
+
+    if isinstance(x, dict) and "value" in x:
+        x = x["value"]
+
     if not isinstance(x, torch.Tensor):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
@@ -266,13 +291,13 @@ def _comparison_preprocessor(x_baseline, x_target, name):
 
 @dataclass
 class LocationInfo:
-    baseline_forward_pass_id: int
+    baseline_step: int
     baseline_token_slice: slice
 
 
-def _get_location_info_of_target_pass_id() -> Dict[int, LocationInfo]:
+def _get_location_info_of_target_pass_id() -> Optional[Dict[int, LocationInfo]]:
     """Customization endpoint."""
-    return {}
+    return None
 
 
 @dataclass
@@ -296,5 +321,8 @@ if __name__ == "__main__":
     parser.add_argument("--end-id", type=int, default=1000000)
     parser.add_argument("--baseline-start-id", type=int, default=0)
     parser.add_argument("--diff-threshold", type=float, default=1e-3)
+    parser.add_argument(
+        "--filter", type=str, default=None, help="Regex to filter filenames"
+    )
     args = parser.parse_args()
     main(args)

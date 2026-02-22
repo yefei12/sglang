@@ -13,32 +13,39 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+
 import logging
 import math
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -59,7 +66,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var
+from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -81,10 +88,8 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -102,6 +107,7 @@ class Qwen3_VisionMLP(nn.Module):
             prefix=add_prefix("linear_fc2", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.act = ACT2FN[hidden_act]
 
@@ -172,6 +178,7 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -231,10 +238,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = (
-            1 if use_data_parallel else get_tensor_model_parallel_world_size()
-        )
-        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
@@ -253,6 +258,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             prefix=add_prefix("linear_fc2", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -278,6 +284,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        self.pp_group = get_pp_group()
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -297,7 +304,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 + len(self.deepstack_visual_indexes)
         )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        if self.pp_group.is_first_rank:
+            self.pos_embed = VocabParallelEmbedding(
+                self.num_position_embeddings,
+                self.hidden_size,
+                quant_config=quant_config,
+                use_attn_tp_group=is_dp_attention_enabled(),
+                prefix=add_prefix("pos_embed", prefix),
+            )
+        else:
+            self.pos_embed = PPMissingLayer()
+
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
@@ -381,31 +398,130 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        patch_pos_embeds_permute = []
-        m_size = self.spatial_merge_size
+    def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
+        """
+        Compute continuous interpolation indices for a single dimension.
 
-        embeds = torch.arange(self.num_grid, device=self.pos_embed.weight.device)
-        embeds = (
-            self.pos_embed(embeds)
-            .permute(1, 0)
-            .reshape(1, -1, self.num_grid_per_side, self.num_grid_per_side)
+        Returns continuous indices.
+        """
+        if self.align_corners:
+            indices = np.linspace(
+                0, self.num_grid_per_side - 1, dim_size, dtype=np.float32
+            )
+        else:
+            indices = (np.arange(dim_size, dtype=np.float32) + 0.5) * (
+                self.num_grid_per_side / dim_size
+            ) - 0.5
+            indices = np.clip(indices, 0, self.num_grid_per_side - 1)
+        return indices
+
+    def _calculate_indices_and_weights(self, h_idxs, w_idxs):
+        """
+        Compute bilinear interpolation indices and weights.
+
+        Returns tuple of (indices, weights), each as 4 numpy arrays for the 4 corner points.
+        """
+        h_f = np.floor(h_idxs).astype(np.int64)
+        h_c = np.clip(h_f + 1, 0, self.num_grid_per_side - 1)
+        dh = h_idxs - h_f
+
+        w_f = np.floor(w_idxs).astype(np.int64)
+        w_c = np.clip(w_f + 1, 0, self.num_grid_per_side - 1)
+        dw = w_idxs - w_f
+
+        side = self.num_grid_per_side
+
+        indices = [
+            (h_f[:, None] * side + w_f).flatten(),
+            (h_f[:, None] * side + w_c).flatten(),
+            (h_c[:, None] * side + w_f).flatten(),
+            (h_c[:, None] * side + w_c).flatten(),
+        ]
+        weights = [
+            ((1 - dh)[:, None] * (1 - dw)).flatten(),
+            ((1 - dh)[:, None] * dw).flatten(),
+            (dh[:, None] * (1 - dw)).flatten(),
+            (dh[:, None] * dw).flatten(),
+        ]
+        return indices, weights
+
+    def _get_position_embedding(self, patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+        """
+        Tile and reorganize position embeddings to align with the token sequence.
+        """
+        result_parts = []
+        merge_size = self.spatial_merge_size
+
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            pos_embed = pos_embed.repeat(t, 1)
+
+            h_merge = h // merge_size
+            w_merge = w // merge_size
+
+            pos_embed = (
+                pos_embed.view(t, h_merge, merge_size, w_merge, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+
+            result_parts.append(pos_embed)
+
+        return torch.cat(result_parts, dim=0)
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        """Interpolate position embeddings for (batch, 3) size input dimensions.
+
+        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
+        along temporal dimension. The result is reorganized according to spatial_merge_size.
+
+        Args:
+            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
+                     in patches for each sample.
+
+        Returns:
+            Interpolated position embeddings tensor.
+        """
+        grid_thw_cpu = grid_thw.cpu().numpy()
+
+        # transfer data to CPU before loop
+        temporal_dims = grid_thw_cpu[:, 0].tolist()
+        height_dims = grid_thw_cpu[:, 1].tolist()
+        width_dims = grid_thw_cpu[:, 2].tolist()
+
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
+        total_patches = sum(patches_size)
+        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
+        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
+
+        current_idx = 0
+
+        # calculate indices and weights on CPU
+        for t, h, w in zip(temporal_dims, height_dims, width_dims):
+            h_idxs = self._get_interpolation_indices(h)
+            w_idxs = self._get_interpolation_indices(w)
+
+            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
+
+            end_idx = current_idx + h * w
+            for i in range(4):
+                all_indices_np[i, current_idx:end_idx] = indices[i]
+                all_weights_np[i, current_idx:end_idx] = weights[i]
+            current_idx = end_idx
+
+        idx_tensor = torch.from_numpy(all_indices_np).to(device)
+        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
+
+        # calculate interpolation
+        pos_embeds = self.pos_embed(idx_tensor.view(-1))
+        pos_embeds = pos_embeds.view(4, total_patches, -1)
+        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
+        patch_pos_embeds = patch_pos_embeds.split(patches_size)
+        return self._get_position_embedding(
+            patch_pos_embeds, temporal_dims, height_dims, width_dims
         )
-        for t, h, w in grid_thw:
-            pos_embed = torch.nn.functional.interpolate(
-                embeds, size=(h, w), mode="bilinear", align_corners=self.align_corners
-            )
-            pos_embed = pos_embed.reshape(
-                -1,
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            pos_embed = pos_embed.permute(1, 3, 2, 4, 0)
-            pos_embed = pos_embed.flatten(0, 3).repeat(t, 1)
-            patch_pos_embeds_permute.append(pos_embed)
-        return torch.cat(patch_pos_embeds_permute)
 
     def forward(
         self,
@@ -431,9 +547,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if not is_npu():
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        else:
+            cu_seqlens = cu_seqlens.to("cpu")
         x = x.unsqueeze(1)
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -549,6 +668,18 @@ class Qwen3LLMModel(Qwen3Model):
             len(config.vision_config.deepstack_visual_indexes)
         )
 
+    def get_deepstack_embeds(
+        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Get deepstack embeddings for a given layer index, or None if not applicable."""
+        if (
+            input_deepstack_embeds is None
+            or layer_idx not in self.deepstack_embed_to_decoder_layer
+        ):
+            return None
+        sep = self.hidden_size * layer_idx
+        return input_deepstack_embeds[:, sep : sep + self.hidden_size]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -580,20 +711,26 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
+            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+            # The order matters because addition with different tensors is not associative in practice.
+            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
+            deepstack_embeds = self.get_deepstack_embeds(
+                layer_idx - 1, input_deepstack_embeds
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                post_residual_addition=deepstack_embeds,
             )
 
-            # process deepstack
-            if (
-                input_deepstack_embeds is not None
-                and layer_idx in self.deepstack_embed_to_decoder_layer
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
+        # Handle deepstack for the last processed layer if it exists.
+        last_deepstack = self.get_deepstack_embeds(
+            self.end_layer - 1, input_deepstack_embeds
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -607,7 +744,9 @@ class Qwen3LLMModel(Qwen3Model):
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
+                    hidden_states, _ = self.norm(
+                        hidden_states, residual, post_residual_addition=last_deepstack
+                    )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -647,9 +786,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=None,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("visual", prefix),
+            prefix=add_prefix("model.visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
 
@@ -665,7 +804,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
-                prefix=add_prefix("model", prefix),
+                prefix=add_prefix("model.language_model", prefix),
             )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
@@ -675,6 +814,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=quant_config,
+                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )
             else:
@@ -814,10 +954,18 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        for item in items:
+            item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        # Memory optimization for item.feature:
+        # 1. item.feature is released when request finished
+        # 2. High concurrency may cause device OOM due to delayed release
+        # 3. Fix: Offload item.feature to CPU, move to device only when needed
+        for item in items:
+            item.feature = item.feature.to("cpu")
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
@@ -912,7 +1060,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
 
-            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+            # Only copy embed_tokens to lm_head when tie_word_embeddings=True
+            # For models with tie_word_embeddings=False (e.g. 8B), lm_head has independent weights
+            if (
+                self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and self.config.tie_word_embeddings
+            ):
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(
@@ -924,6 +1078,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if (
                 not is_visual
                 and layer_id is not None
+                and hasattr(self, "model")
                 and hasattr(self.model, "start_layer")
                 and (
                     layer_id < self.model.start_layer
@@ -955,7 +1110,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 if "visual" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                    name = name.replace(r"model.visual.", r"visual.")
 
                 try:
                     # Skip loading extra bias for GPTQ models.
