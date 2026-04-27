@@ -224,6 +224,24 @@ def _load_deepseek_temp_model(
     config_json["architectures"] = [architecture]
     config_json["model_type"] = "deepseek_v3"
 
+    # The packaged backup config is built for FP8 and always carries a
+    # quantization_config. When the real checkpoint is BF16, drop it so the loader
+    # doesn't try to dequantize BF16 weights as FP8.
+    if backup_mode != "none" and "quantization_config" in config_json:
+        original_config_path = os.path.join(local_path, "config.json")
+        checkpoint_has_quant_config = False
+        if os.path.exists(original_config_path):
+            with open(original_config_path, "r") as f:
+                checkpoint_has_quant_config = "quantization_config" in json.load(f)
+        else:
+            logger.warning(
+                f"Checkpoint config.json not found at {original_config_path}; "
+                f"dropping quantization_config from backup config."
+            )
+            
+        if not checkpoint_has_quant_config:
+            del config_json["quantization_config"]
+
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
