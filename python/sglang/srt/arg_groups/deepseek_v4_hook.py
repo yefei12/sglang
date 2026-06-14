@@ -33,12 +33,13 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
 
     if server_args.speculative_algorithm is not None:
-        assert (
-            server_args.speculative_algorithm == "EAGLE"
-        ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
+        assert server_args.speculative_algorithm in (
+            "EAGLE",
+            "EAGLE3",
+        ), f"Only EAGLE/EAGLE3 speculative algorithm is supported for {model_arch}"
         assert (
             server_args.speculative_eagle_topk == 1
-        ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+        ), f"Only EAGLE/EAGLE3 speculative algorithm with topk == 1 is supported for {model_arch}"
 
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         server_args.swa_full_tokens_ratio = 0.1

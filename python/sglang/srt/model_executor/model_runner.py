@@ -2387,6 +2387,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 init_new_workspace=init_new_workspace,
             )
 
+        if (
+            self.is_draft_worker
+            and self.server_args.attention_backend == "dsv4"
+        ):
+            draft_arch = getattr(
+                self.model_config.hf_config, "architectures", [None]
+            )[0]
+            if draft_arch is None or not draft_arch.startswith("Deepseek"):
+                fallback = self.server_args._get_default_attn_backend(
+                    use_mla_backend=False,
+                    model_config=self.model_config,
+                )
+                logger.warning(
+                    f"Draft model is not DeepSeekV4, falling back attention backend "
+                    f"from 'dsv4' to '{fallback}'."
+                )
+                return self._get_attention_backend_from_str(
+                    fallback,
+                    init_new_workspace=init_new_workspace,
+                )
+
         (
             self.prefill_attention_backend_str,
             self.decode_attention_backend_str,

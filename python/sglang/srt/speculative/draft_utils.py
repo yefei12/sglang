@@ -31,6 +31,19 @@ class DraftBackendFactory:
         if backend_type is None:
             backend_type = self.server_args.attention_backend
 
+        if backend_type == "dsv4":
+            draft_hf_config = self.draft_model_runner.model_config.hf_config
+            draft_arch = getattr(draft_hf_config, "architectures", [None])[0]
+            if draft_arch is None or not draft_arch.startswith("Deepseek"):
+                backend_type = self.server_args._get_default_attn_backend(
+                    use_mla_backend=False,
+                    model_config=self.draft_model_runner.model_config,
+                )
+                logger.warning(
+                    "Draft model is not DeepSeekV4, falling back draft attention "
+                    f"backend from 'dsv4' to '{backend_type}'."
+                )
+
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
 

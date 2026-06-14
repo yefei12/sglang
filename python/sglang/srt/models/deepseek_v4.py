@@ -1583,6 +1583,7 @@ class DeepseekV4Model(nn.Module):
         else:
             self.norm = PPMissingLayer()
         self.gemm_output_zero_allocator_size = 0
+        self.layers_to_capture = []
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
@@ -1671,7 +1672,17 @@ class DeepseekV4Model(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
+        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    self.hc_head(
+                        hidden_states,
+                        self.hc_head_fn,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                    )
+                )
             layer = self.layers[i]
             last_layer = layer
             ctx = (
@@ -1715,6 +1726,8 @@ class DeepseekV4Model(nn.Module):
         )
         hidden_states = self.norm(hidden_states)
 
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states, pre_hc_head
         return hidden_states, pre_hc_head
 
 
@@ -1839,16 +1852,23 @@ class DeepseekV4ForCausalLM(nn.Module):
             return hidden_states
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-        hidden_states, pre_hc_head = hidden_states
+        if self.capture_aux_hidden_states and len(hidden_states) == 3:
+            hidden_states, aux_hidden_states, pre_hc_head = hidden_states
+        else:
+            hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None
+                if aux_hidden_states is not None
+                and forward_batch.capture_hidden_mode is not None
+                and forward_batch.capture_hidden_mode.need_capture()
+                else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
@@ -2305,6 +2325,24 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_logical_experts=config.n_routed_experts,
             num_groups=None,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            # Aux capture runs before layer(i), so to capture the output of
+            # layer N we must capture at index N+1. Heuristic from V2: if the
+            # first ID is 1 the list needs shifting.
+            if layer_ids and layer_ids[0] == 1:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            else:
+                self.model.layers_to_capture = list(layer_ids)
 
 
 EntryClass = [DeepseekV4ForCausalLM]
