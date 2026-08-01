@@ -61,10 +61,6 @@ class DraftBackendFactory:
                     use_mla_backend=False,
                     model_config=self.draft_model_runner.model_config,
                 )
-                logger.warning(
-                    "Draft model is not DeepSeekV4, falling back draft attention "
-                    f"backend from 'dsv4' to '{backend_type}'."
-                )
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
