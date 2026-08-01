@@ -10,6 +10,7 @@ from sglang.srt.model_executor.model_runner_components import (
 )
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     ResolvedAttentionBackendStr,
+    _resolve_attention_backend_strs,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -67,6 +68,36 @@ def test_split_full_attention_applies_model_wrapper_once():
     assert split_backend.decode_backend.name == "decode"
     assert split_backend.prefill_backend.name == "prefill"
     assert runner.init_new_workspace is True
+
+
+@pytest.mark.parametrize(
+    ("draft_override", "prefill", "decode", "expected_prefill", "expected_decode"),
+    [
+        ("dsv4", "dsv4", "dsv4", "triton", "triton"),
+        (None, "dsv4", "fa3", "triton", "fa3"),
+    ],
+)
+def test_non_dsv4_draft_falls_back_per_backend(
+    draft_override, prefill, decode, expected_prefill, expected_decode
+):
+    server_args = SimpleNamespace(
+        speculative_draft_attention_backend=draft_override,
+        get_attention_backends=lambda: (prefill, decode),
+        _get_default_attn_backend=lambda **kwargs: "triton",
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+    )
+
+    resolved = _resolve_attention_backend_strs(
+        server_args=server_args,
+        is_draft_worker=True,
+        model_config=model_config,
+    )
+
+    assert resolved.prefill == expected_prefill
+    assert resolved.decode == expected_decode
+    assert resolved.is_draft_override is (draft_override is not None)
 
 
 if __name__ == "__main__":
