@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
+
 from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
@@ -203,10 +204,8 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
 
 def is_namespaced_dspark_bundle(config: Any) -> bool:
     return (
-        _cfg_get(config, "dspark_bundle_format", None)
-        == "namespaced_safetensors"
-        and _cfg_get(config, "dspark_bundle_version", None)
-        == 1
+        _cfg_get(config, "dspark_bundle_format", None) == "namespaced_safetensors"
+        and _cfg_get(config, "dspark_bundle_version", None) == 1
         and bool(_get_dspark_config(config))
     )
 
@@ -218,19 +217,17 @@ def apply_namespaced_dspark_draft_config(config: Any) -> bool:
 
     dspark_config = _get_dspark_config(config)
     architectures = dspark_config.get("architectures")
-    if not isinstance(architectures, (list, tuple)) or not architectures:
-        raise ValueError(
-            "A namespaced DSpark bundle requires dspark_config.architectures."
-        )
+    if architectures != ["LingV3ForCausalLMDSparkMLA"]:
+        raise ValueError("Unsupported namespaced DSpark draft architecture.")
     attention_type = dspark_config.get("attention_type")
+    if attention_type != "mla":
+        raise ValueError("Ling DSpark bundles require MLA attention.")
     for key, value in dspark_config.items():
         setattr(config, key, value)
-    if isinstance(attention_type, str):
-        config.full_attention_type = attention_type
-        config.attention_type = 1
-        if architectures == ["LingV3ForCausalLMDSparkMLA"]:
-            # The target is KDA/MLA hybrid; this draft contains MLA layers only.
-            config.use_kda = False
+    config.full_attention_type = attention_type
+    config.attention_type = 1
+    # The target is KDA/MLA hybrid; this draft contains MLA layers only.
+    config.use_kda = False
     return True
 
 

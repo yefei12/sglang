@@ -1204,7 +1204,6 @@ class ModelConfig:
                 )
                 return
 
-
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",

@@ -7,36 +7,20 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.layer_boundary.factories import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_utils import (
-    block_quant_dequant,
-    block_quant_to_tensor_quant,
-    channel_quant_to_tensor_quant,
-    normalize_e4m3fn_to_e4m3fnuz,
-)
-from sglang.srt.layers.quantization.int8_utils import (
-    block_dequant as int8_block_dequant,
-)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe_v3 import (
     BailingMoELinearDecoderLayer,
-)
-from sglang.srt.models.deepseek_common.utils import (
-    _is_cpu,
-    _is_cpu_amx_available,
-    _is_cuda,
-    _is_hip,
+    prepare_bailing_mla_weights,
 )
 from sglang.srt.models.dspark import (
     build_confidence_head,
@@ -44,7 +28,6 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
-from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     is_namespaced_dspark_bundle,
@@ -53,10 +36,6 @@ from sglang.srt.utils import BumpAllocator
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
-_is_fp8_fnuz = is_fp8_fnuz()
-
-from sglang.srt.models.bailing_moe_v3 import _get_awq_dequantize
 
 
 class LingV3ForCausalLMDSparkMLA(nn.Module):
@@ -164,45 +143,6 @@ class LingV3ForCausalLMDSparkMLA(nn.Module):
             pool=pool,
             positions=positions,
             cache_loc=cache_loc,
-        )
-
-    @torch.inference_mode()
-    def write_target_hidden_kv_static(
-        self,
-        *,
-        target_hidden: torch.Tensor,
-        pool,
-        positions: torch.Tensor,
-        cache_loc: torch.Tensor,
-        commit_lens: torch.Tensor,
-        verify_len: int,
-    ) -> None:
-        """Commit a fixed verify window while skipping rejected KV rows."""
-        cache_loc = cache_loc.reshape(-1)
-        positions = positions.reshape(-1)
-        num_rows = target_hidden.shape[0]
-        if (
-            num_rows != cache_loc.numel()
-            or num_rows != positions.numel()
-            or num_rows != commit_lens.numel() * verify_len
-        ):
-            raise ValueError(
-                "DSpark static KV write shape mismatch: "
-                f"hidden={num_rows}, cache_loc={cache_loc.numel()}, "
-                f"positions={positions.numel()}, commit_lens={commit_lens.numel()}, "
-                f"verify_len={verify_len}."
-            )
-
-        col = torch.arange(verify_len, device=cache_loc.device).view(1, -1)
-        committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
-        masked_cache_loc = torch.where(
-            committed, cache_loc, torch.zeros_like(cache_loc)
-        )
-        self._write_target_hidden_kv_rows(
-            target_hidden=target_hidden,
-            pool=pool,
-            positions=positions,
-            cache_loc=masked_cache_loc,
         )
 
     def _write_target_hidden_kv_rows(
@@ -352,10 +292,6 @@ class LingV3ForCausalLMDSparkMLA(nn.Module):
                         del cached_a_proj[q_a_name]
                         del cached_a_proj[kv_a_name]
                     continue
-                # Standalone shared-expert scales: when TP cuts a block through
-                # the shared intermediate, the serialized global scale must be
-                # cached (not TP-sliced) and the merged param satisfied by the
-                # post-load requant; mirrors the target BailingMoeV3.
                 for param_suffix, ckpt_suffix, shard_id in stacked_mapping:
                     if ckpt_suffix not in name or ".experts." in name:
                         continue
@@ -432,160 +368,8 @@ class LingV3ForCausalLMDSparkMLA(nn.Module):
                 "Ling DSpark checkpoint does not match the model: "
                 f"unexpected={unexpected[:20]}, missing={missing[:20]}."
             )
-        self._post_load_weights()
+        prepare_bailing_mla_weights(self.layers, self.quant_config)
         return loaded
-
-    def _post_load_weights(self) -> None:
-        self._post_load_mla_weights()
-
-    def _post_load_mla_weights(self) -> None:
-        for layer in self.layers:
-            self_attn = layer.attention
-            if not hasattr(self_attn, "kv_b_proj"):
-                continue
-            if hasattr(self_attn.kv_b_proj, "qweight"):
-                # AWQ compatible
-                if _is_cuda or _is_hip:
-                    w = _get_awq_dequantize()(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                    ).T
-                else:
-                    w = _get_awq_dequantize()(
-                        self_attn.kv_b_proj.qweight,
-                        self_attn.kv_b_proj.scales,
-                        self_attn.kv_b_proj.qzeros,
-                        0,
-                        0,
-                        0,
-                    ).T
-            else:
-                w = self_attn.kv_b_proj.weight
-            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
-            # This may affect the accuracy of fp8 model.
-            # Fix deepseek v3 blockwise bmm by using deep_gemm
-            use_deep_gemm_bmm = False
-
-            if w.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-            ):
-                if (
-                    hasattr(self.quant_config, "weight_block_size")
-                    and self.quant_config.weight_block_size is not None
-                ):
-                    weight_block_size = self.quant_config.weight_block_size
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                    if _is_fp8_fnuz:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                            input_scale=None,
-                        )
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-
-                    if (
-                        _is_cuda
-                        and weight_block_size[0] == 128
-                        and weight_block_size[1] == 128
-                    ):
-                        if (
-                            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and envs.SGLANG_USE_DEEPGEMM_BMM.get()
-                        ):
-                            block_scale = weight_scale
-                            use_deep_gemm_bmm = True
-                        else:
-                            w = block_quant_dequant(
-                                weight,
-                                weight_scale,
-                                weight_block_size,
-                                torch.bfloat16,
-                            )
-                    else:
-                        w, scale = block_quant_to_tensor_quant(
-                            weight, weight_scale, weight_block_size
-                        )
-                        self_attn.w_scale = scale
-                else:
-                    if _is_fp8_fnuz:
-                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                            weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale,
-                            input_scale=None,
-                        )
-                    else:
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale
-
-                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
-
-            if w.dtype == torch.int8:
-                if hasattr(self.quant_config, "weight_block_size"):
-                    # block-wise int8 need it
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                        w = int8_block_dequant(
-                            weight, weight_scale, weight_block_size
-                        ).to(torch.bfloat16)
-                else:
-                    # channel-wise int8 need it
-                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
-                        torch.bfloat16
-                    )
-
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            if not use_deep_gemm_bmm:
-                self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
-                if (
-                    hasattr(self_attn.kv_b_proj, "weight_scale")
-                    and self_attn.w_scale is None
-                ):
-                    self_attn.w_scale = bind_or_assign(
-                        self_attn.w_scale, self_attn.kv_b_proj.weight_scale
-                    )
-                    if _is_hip:
-                        self_attn.w_scale *= 2.0
-                # TODO: remove this after adding FP8 support in bmm cpu kernel
-                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
-                    self_attn.w_kc = (
-                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
-                    )
-                    self_attn.w_vc = (
-                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
-                    )
-            else:
-                num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
-                num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
-                ws_kc, ws_vc = block_scale.unflatten(
-                    0, (-1, (num_tiles_k + num_tiles_n))
-                ).split([num_tiles_k, num_tiles_n], dim=1)
-                self_attn.w_scale_k = bind_or_assign(
-                    self_attn.w_scale_k, ws_kc.transpose(1, 2).contiguous()
-                )
-                self_attn.w_scale_v = bind_or_assign(
-                    self_attn.w_scale_v, ws_vc.contiguous()
-                )
-                self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous()
-                )
-                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
-                self_attn.use_deep_gemm_bmm = True
 
 
 EntryClass = [LingV3ForCausalLMDSparkMLA]

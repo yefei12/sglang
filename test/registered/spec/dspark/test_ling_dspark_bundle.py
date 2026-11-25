@@ -2,8 +2,10 @@ import copy
 import unittest
 from types import SimpleNamespace
 
+import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.models.bailing_moe_v3 import prepare_bailing_mla_weights
 from sglang.srt.speculative.dspark_components.dspark_config import (
     apply_namespaced_dspark_draft_config,
     checkpoint_bundles_dspark_draft,
@@ -100,6 +102,40 @@ class TestLingDSparkBundle(unittest.TestCase):
         config = bundle()
         apply_namespaced_dspark_draft_config(config)
         self.assertIsNone(mambaish_config(SimpleNamespace(hf_config=config)))
+
+    def test_unsupported_bundle_fields_fail_before_mutation(self):
+        for field, value in (
+            ("architectures", ["BailingMoeV3ForCausalLM"]),
+            ("architectures", [123]),
+            ("attention_type", "gqa"),
+        ):
+            with self.subTest(field=field, value=value):
+                config = bundle()
+                config.dspark_config[field] = value
+                with self.assertRaises(ValueError):
+                    apply_namespaced_dspark_draft_config(config)
+                self.assertEqual(config.num_hidden_layers, 72)
+                self.assertTrue(config.use_kda)
+
+    def test_shared_mla_projection_views_and_reentry(self):
+        weight = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+        attention = SimpleNamespace(
+            kv_b_proj=SimpleNamespace(weight=weight),
+            qk_nope_head_dim=2,
+            v_head_dim=2,
+            w_kc=None,
+            w_vc=None,
+        )
+        layers = [SimpleNamespace(attention=attention)]
+        prepare_bailing_mla_weights(layers, None)
+        expected_k, expected_v = weight.reshape(2, 4, 4).split(2, dim=1)
+        torch.testing.assert_close(attention.w_kc, expected_k)
+        torch.testing.assert_close(attention.w_vc, expected_v.transpose(1, 2))
+        pointers = attention.w_kc.data_ptr(), attention.w_vc.data_ptr()
+        prepare_bailing_mla_weights(layers, None)
+        self.assertEqual(
+            pointers, (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
+        )
 
     def test_legacy_bundle_still_detected(self):
         config = SimpleNamespace(dspark_block_size=5)
